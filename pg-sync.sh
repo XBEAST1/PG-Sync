@@ -42,20 +42,20 @@ ensure_gitignore() {
 
 get_db_connection() {
     echo -e "${BLUE}Enter the database connection URL:${NC}"
-    echo -e "${CYAN}Format: postgresql://username:password@host:port/database_name${NC}"
+    echo -e "${CYAN}Format: postgresql://username:password@host:port/database_name or postgres://...${NC}"
     echo ""
     read -r DB_URL
     
-    if [[ ! "$DB_URL" =~ ^postgresql:// ]]; then
+    if [[ ! "$DB_URL" =~ ^postgres(ql)?:// ]]; then
         echo -e "${RED}✗ Invalid database URL format${NC}"
         exit 1
     fi
     
-    DB_USER=$(echo "$DB_URL" | sed -n 's|postgresql://\([^:]*\):.*|\1|p')
-    DB_PASS=$(echo "$DB_URL" | sed -n 's|postgresql://[^:]*:\([^@]*\)@.*|\1|p')
+    DB_USER=$(echo "$DB_URL" | sed -n 's|^.*://\([^:]*\):.*|\1|p')
+    DB_PASS=$(echo "$DB_URL" | sed -n 's|^.*://[^:]*:\([^@]*\)@.*|\1|p')
     DB_HOST=$(echo "$DB_URL" | sed -n 's|.*@\([^:]*\):.*|\1|p')
     DB_PORT=$(echo "$DB_URL" | sed -n 's|.*:\([0-9]*\)/.*|\1|p')
-    DB_NAME=$(echo "$DB_URL" | sed -n 's|.*/\([^/]*\)$|\1|p')
+    DB_NAME=$(echo "$DB_URL" | sed -n 's|.*/\([^/?]*\).*|\1|p')
     
     echo -e "${GREEN}✓ Connection parsed${NC}"
     echo -e "  Host: ${DB_HOST}:${DB_PORT}"
