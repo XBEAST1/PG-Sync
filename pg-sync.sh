@@ -13,6 +13,14 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_BASE_DIR="$SCRIPT_DIR/pg-sync-db-backup"
+LOCK_FILE="/tmp/pg-sync.lock"
+
+# Acquire lock
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo -e "${RED}Another instance of PG-Sync is running.${NC}"
+    exit 1
+fi
 
 MIGRATION_TABLES=(
     "alembic_version"
@@ -22,6 +30,17 @@ MIGRATION_TABLES=(
     "knex_migrations"
     "knex_migrations_lock"
 )
+
+cleanup_partial_backup() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ] && [ -n "$CURRENT_BACKUP_SET" ] && [ -d "$CURRENT_BACKUP_SET" ]; then
+        echo -e "${RED}FAILURE DETECTED: Cleaning up incomplete backup set...${NC}"
+        rm -rf "$CURRENT_BACKUP_SET"
+        echo -e "${YELLOW}Removed: $CURRENT_BACKUP_SET${NC}"
+    fi
+    # Release lock
+    flock -u 9
+}
 
 ensure_gitignore() {
     local gitignore_path="$SCRIPT_DIR/.gitignore"
@@ -51,14 +70,14 @@ get_db_connection() {
         exit 1
     fi
     
-    DB_USER=$(echo "$DB_URL" | sed -n 's|^.*://\([^:]*\):.*|\1|p')
-    DB_PASS=$(echo "$DB_URL" | sed -n 's|^.*://[^:]*:\([^@]*\)@.*|\1|p')
-    DB_HOST=$(echo "$DB_URL" | sed -n 's|.*@\([^:]*\):.*|\1|p')
-    DB_PORT=$(echo "$DB_URL" | sed -n 's|.*:\([0-9]*\)/.*|\1|p')
-    DB_NAME=$(echo "$DB_URL" | sed -n 's|.*/\([^/?]*\).*|\1|p')
+    local DB_USER=$(echo "$DB_URL" | sed -n 's|^.*://\([^:]*\):.*|\1|p')
+    local DB_HOST=$(echo "$DB_URL" | sed -n 's|.*@\([^:]*\):.*|\1|p')
+    local DB_PORT=$(echo "$DB_URL" | sed -n 's|.*:\([0-9]*\)/.*|\1|p')
+    local DB_NAME=$(echo "$DB_URL" | sed -n 's|.*/\([^/?]*\).*|\1|p')
     
-    echo -e "${GREEN}✓ Connection parsed${NC}"
-    echo -e "  Host: ${DB_HOST}:${DB_PORT}"
+    echo -e "${GREEN}✓ Connection details parsed${NC}"
+    echo -e "  Host: ${DB_HOST}"
+    echo -e "  Port: ${DB_PORT}"
     echo -e "  Database: ${DB_NAME}"
     echo -e "  User: ${DB_USER}"
     echo ""
@@ -66,57 +85,24 @@ get_db_connection() {
 
 test_db_connection() {
     echo -e "${YELLOW}Testing connection...${NC}"
-    export PGPASSWORD="$DB_PASS"
     
-    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
+    if psql "$DB_URL" -c "SELECT 1" >/dev/null 2>&1; then
         echo -e "${GREEN}✓ Connection successful${NC}"
         echo ""
-        unset PGPASSWORD
         return 0
     else
         echo -e "${RED}✗ Connection failed${NC}"
         echo -e "${YELLOW}Please check your credentials and network access${NC}"
-        unset PGPASSWORD
         exit 1
     fi
 }
 
-build_migration_pattern() {
-    local pattern=""
-    for table in "${MIGRATION_TABLES[@]}"; do
-        [ -n "$pattern" ] && pattern="$pattern|"
-        pattern="$pattern$table"
-    done
-    echo "$pattern"
-}
-
-truncate_all_tables() {
-    echo -e "${YELLOW}Truncating all tables...${NC}"
-    
-    local TRUNCATE_CMD="SELECT 'TRUNCATE TABLE ' || quote_ident(schemaname) || '.' || quote_ident(tablename) || ' CASCADE;' 
-                        FROM pg_tables 
-                        WHERE schemaname NOT IN ('pg_catalog', 'information_schema');"
-    
-    local TABLES_TO_TRUNCATE=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "$TRUNCATE_CMD")
-    
-    if [ -n "$TABLES_TO_TRUNCATE" ]; then
-        if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "$TABLES_TO_TRUNCATE" >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ All tables truncated${NC}"
-        else
-            echo -e "${RED}✗ Truncation failed${NC}"
-            unset PGPASSWORD
-            exit 1
-        fi
-    else
-        echo -e "${YELLOW}! No tables found${NC}"
-    fi
-    echo ""
-}
-
-
 backup_database() {
     TIMESTAMP=$(date +"%d-%m-%Y_%I-%M%p")
     CURRENT_BACKUP_SET="$BACKUP_BASE_DIR/backup_$TIMESTAMP"
+    
+    # Register cleanup trap
+    trap cleanup_partial_backup EXIT INT TERM
     
     echo -e "${BLUE}═══════════════════════════════════════${NC}"
     echo -e "${BLUE}        PG-SYNC: STARTING BACKUP       ${NC}"
@@ -126,35 +112,43 @@ backup_database() {
     mkdir -p "$CURRENT_BACKUP_SET"
     get_db_connection
     test_db_connection
-    export PGPASSWORD="$DB_PASS"
     
-    COMMON_FLAGS="--no-owner --no-privileges"
+    COMMON_FLAGS="--no-owner --no-privileges --no-comments"
     CLEAN_FLAGS="--clean --if-exists"
     EXCLUDE_TABLES=""
     for table in "${MIGRATION_TABLES[@]}"; do EXCLUDE_TABLES="$EXCLUDE_TABLES -T $table"; done
     
     echo -e "${CYAN}[1/3] Dumping Schema...${NC}"
-    if ! pg_dump $CLEAN_FLAGS $COMMON_FLAGS -v -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" --schema-only -f "$CURRENT_BACKUP_SET/schema.sql" 2>&1; then
+    if ! pg_dump "$DB_URL" $CLEAN_FLAGS $COMMON_FLAGS -v --schema-only -f "$CURRENT_BACKUP_SET/schema.sql" 2>&1; then
         echo -e "${RED}✗ Schema backup failed${NC}"
-        unset PGPASSWORD
         exit 1
     fi
     
     echo -e "${CYAN}[2/3] Dumping Data (excluding migrations)...${NC}"
-    if ! pg_dump $COMMON_FLAGS -v -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" --data-only $EXCLUDE_TABLES -f "$CURRENT_BACKUP_SET/data.sql" 2>&1; then
+    if ! pg_dump "$DB_URL" $COMMON_FLAGS -v --data-only $EXCLUDE_TABLES -f "$CURRENT_BACKUP_SET/data.sql" 2>&1; then
         echo -e "${RED}✗ Data backup failed${NC}"
-        unset PGPASSWORD
         exit 1
     fi
     
     echo -e "${CYAN}[3/3] Dumping Full Backup...${NC}"
-    if ! pg_dump $CLEAN_FLAGS $COMMON_FLAGS -v -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$CURRENT_BACKUP_SET/full_data.sql" 2>&1; then
+    if ! pg_dump "$DB_URL" $CLEAN_FLAGS $COMMON_FLAGS -v -f "$CURRENT_BACKUP_SET/full_data.sql" 2>&1; then
         echo -e "${RED}✗ Full backup failed${NC}"
-        unset PGPASSWORD
         exit 1
     fi
+
+    echo -e "${CYAN}[Safety] Verifying integrity...${NC}"
+    if [ ! -s "$CURRENT_BACKUP_SET/full_data.sql" ]; then
+        echo -e "${RED}✗ Backup integrity check failed: File is empty${NC}"
+        exit 1
+    fi
+
+    # Generate Checksums
+    echo -e "${CYAN}[Safety] Generating SHA256 Checksums...${NC}"
+    (cd "$CURRENT_BACKUP_SET" && sha256sum *.sql > checksums.sha256)
     
-    unset PGPASSWORD
+    # Disable trap on success
+    trap - EXIT INT TERM
+    
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════${NC}"
     echo -e "${GREEN}      PG-SYNC: BACKUP SUCCESSFUL       ${NC}"
@@ -164,13 +158,11 @@ backup_database() {
 }
 
 check_if_database_empty() {
-    local migration_pattern=$(build_migration_pattern)
-    local CHECK_QUERY="SELECT SUM(n_live_tup) FROM pg_stat_user_tables WHERE relname !~ '^($migration_pattern)$';"
-    local ROW_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "$CHECK_QUERY" 2>/dev/null | tr -d '[:space:]')
-    [[ -z "$ROW_COUNT" || "$ROW_COUNT" -eq 0 ]]
+    local CHECK_QUERY="SELECT 1 FROM pg_tables WHERE schemaname = 'public' LIMIT 1;"
+    local EXISTS=$(psql "$DB_URL" -t -c "$CHECK_QUERY" 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$EXISTS" ]]
 }
 
-# Function to get yes/no confirmation
 confirm_yes_no() {
     local prompt="$1"
     local response
@@ -240,47 +232,64 @@ restore_database() {
         exit 1
     fi
 
+    echo -e "${CYAN}[Safety] Verifying checksums...${NC}"
+    if [ -f "$SELECTED_SET/checksums.sha256" ]; then
+        if (cd "$SELECTED_SET" && sha256sum -c checksums.sha256 --status); then
+             echo -e "${GREEN}✓ Checksums verified${NC}"
+        else
+             echo -e "${RED}⚠ CHECKSUM MISMATCH DETECTED!${NC}"
+             echo -e "${YELLOW}The backup files may be corrupted or modified.${NC}"
+             if ! confirm_yes_no "Do you want to proceed despite the warning?"; then
+                 echo -e "${YELLOW}Restore cancelled${NC}"
+                 exit 1
+             fi
+        fi
+    else
+        echo -e "${YELLOW}⚠ No checksums found (older backup). Skipping verification.${NC}"
+    fi
+
     get_db_connection
     test_db_connection
     
-    local DO_TRUNCATE="no"
+    echo -e "${CYAN}Restoring $RESTORE_TYPE...${NC}"
+    if ! confirm_yes_no "Are you sure you want to proceed with the restore?"; then
+        echo -e "${YELLOW}Restore cancelled${NC}"
+        exit 0
+    fi
+
+    echo ""
+
+    local TRUNCATE_SQL=""
     if [ "$type_choice" -eq 2 ]; then
         if check_if_database_empty; then 
             echo -e "${GREEN}✓ Database is empty${NC}"
         else
             echo -e "${YELLOW}⚠ Database contains data${NC}"
             if confirm_yes_no "Wipe existing data before restoring?"; then
-                DO_TRUNCATE="yes"
-            else
-                DO_TRUNCATE="no"
+                echo -e "${YELLOW}Preparing truncate commands...${NC}"
+                TRUNCATE_SQL=$(psql "$DB_URL" -t -c "SELECT 'TRUNCATE TABLE ' || quote_ident(schemaname) || '.' || quote_ident(tablename) || ' CASCADE;' FROM pg_tables WHERE schemaname = 'public';")
             fi
-            echo ""
         fi
     fi
 
-    export PGPASSWORD="$DB_PASS"
-    
-    if [ "$DO_TRUNCATE" == "yes" ]; then
-        truncate_all_tables
-    else
-        echo -e "${CYAN}Restoring $RESTORE_TYPE...${NC}"
-        if ! confirm_yes_no "Are you sure you want to proceed with the restore?"; then
-            echo -e "${YELLOW}Restore cancelled${NC}"
-            unset PGPASSWORD
-            exit 0
+    # Transaction happens immediately after
+    {
+        echo "BEGIN;"
+        if [ -n "$TRUNCATE_SQL" ]; then
+            echo "$TRUNCATE_SQL"
         fi
-    fi
+        cat "$RESTORE_FILE"
+        echo "COMMIT;"
+    } | psql "$DB_URL" -v ON_ERROR_STOP=1 >/dev/null
 
-    echo ""
-    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$RESTORE_FILE" 2>&1; then
+    if [ $? -eq 0 ]; then
         echo ""
         echo -e "${GREEN}═══════════════════════════════════════${NC}"
         echo -e "${GREEN}      PG-SYNC: RESTORE SUCCESSFUL      ${NC}"
         echo -e "${GREEN}═══════════════════════════════════════${NC}"
     else
-        echo -e "${RED}✗ Restore failed${NC}"
+        echo -e "${RED}✗ Restore failed (Transaction Rolled Back)${NC}"
     fi
-    unset PGPASSWORD
 }
 
 main() {
