@@ -176,6 +176,43 @@ confirm_yes_no() {
     done
 }
 
+check_column_existence() {
+    local restore_file="$1"
+    echo -e "${YELLOW}Checking column compatibility...${NC}"
+    
+    MISSING_COLUMNS=""
+    local missing_found=false
+    # Extract COPY commands and check if columns exist in target DB
+    while read -r line; do
+        local table_full=$(echo "$line" | awk '{print $2}')
+        local table=$(echo "$table_full" | cut -d'.' -f2 | tr -d '"')
+        local cols_str=$(echo "$line" | cut -d'(' -f2 | cut -d')' -f1)
+        
+        IFS=',' read -ra cols_array <<< "$cols_str"
+        for col in "${cols_array[@]}"; do
+            local col_clean=$(echo "$col" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '"')
+            local exists=$(psql "$DB_URL" -t -c "SELECT 1 FROM information_schema.columns WHERE table_name='$table' AND column_name='$col_clean';" 2>/dev/null | tr -d '[:space:]')
+            if [ -z "$exists" ]; then
+                echo -e "${RED}⚠ Column '$col_clean' not found in table '$table'${NC}"
+                MISSING_COLUMNS+="${table_full}.${col_clean} "
+                missing_found=true
+            fi
+        done
+    done < <(grep "^COPY " "$restore_file")
+
+    if [ "$missing_found" = true ]; then
+        echo ""
+        if ! confirm_yes_no "Some columns are missing from the target database. Proceed by ignoring them?"; then
+            echo -e "${YELLOW}Restore cancelled${NC}"
+            exit 0
+        fi
+        return 1 # Indicate filtering is needed
+    else
+        echo -e "${GREEN}✓ All backup columns exist in target database${NC}"
+        return 0
+    fi
+}
+
 restore_database() {
     if [ ! -d "$BACKUP_BASE_DIR" ] || [ -z "$(ls -A "$BACKUP_BASE_DIR" 2>/dev/null)" ]; then
         echo -e "${RED}✗ No backups found in $BACKUP_BASE_DIR${NC}"
@@ -250,24 +287,37 @@ restore_database() {
 
     get_db_connection
     test_db_connection
-    
-    echo -e "${CYAN}Restoring $RESTORE_TYPE...${NC}"
-    if ! confirm_yes_no "Are you sure you want to proceed with the restore?"; then
-        echo -e "${YELLOW}Restore cancelled${NC}"
-        exit 0
+
+    local NEEDS_FILTER=0
+
+    if [ "$type_choice" -eq 2 ] || [ "$type_choice" -eq 3 ]; then
+        if ! check_column_existence "$RESTORE_FILE"; then
+            NEEDS_FILTER=1
+        fi
     fi
 
+    echo -e "${CYAN}Restoring $RESTORE_TYPE...${NC}"
     echo ""
 
     local TRUNCATE_SQL=""
-    if [ "$type_choice" -eq 2 ]; then
-        if check_if_database_empty; then 
-            echo -e "${GREEN}✓ Database is empty${NC}"
-        else
-            echo -e "${YELLOW}⚠ Database contains data${NC}"
-            if confirm_yes_no "Wipe existing data before restoring?"; then
-                echo -e "${YELLOW}Preparing truncate commands...${NC}"
-                TRUNCATE_SQL=$(psql "$DB_URL" -t -c "SELECT 'TRUNCATE TABLE ' || quote_ident(schemaname) || '.' || quote_ident(tablename) || ' CASCADE;' FROM pg_tables WHERE schemaname = 'public';")
+    if [ "$type_choice" -eq 2 ] || [ "$NEEDS_FILTER" -eq 1 ]; then
+    
+        if [ "$NEEDS_FILTER" -eq 0 ]; then
+            if ! confirm_yes_no "Are you sure you want to proceed with the restore?"; then
+                echo -e "${YELLOW}Restore cancelled${NC}"
+                exit 0
+            fi
+        fi
+        
+        if [ "$type_choice" -eq 2 ]; then
+            if check_if_database_empty; then 
+                echo -e "${GREEN}✓ Database is empty${NC}"
+            else
+                echo -e "${YELLOW}⚠ Database contains data${NC}"
+                if confirm_yes_no "Wipe existing data before restoring?"; then
+                    echo -e "${YELLOW}Preparing truncate commands...${NC}"
+                    TRUNCATE_SQL=$(psql "$DB_URL" -t -c "SELECT 'TRUNCATE TABLE ' || quote_ident(schemaname) || '.' || quote_ident(tablename) || ' CASCADE;' FROM pg_tables WHERE schemaname = 'public';")
+                fi
             fi
         fi
     fi
@@ -275,10 +325,64 @@ restore_database() {
     # Transaction happens immediately after
     {
         echo "BEGIN;"
-        if [ -n "$TRUNCATE_SQL" ]; then
-            echo "$TRUNCATE_SQL"
+        [ -n "$TRUNCATE_SQL" ] && echo "$TRUNCATE_SQL"
+        if [ "$NEEDS_FILTER" -eq 1 ]; then
+            echo -e "${CYAN}Filtering missing columns from stream...${NC}" >&2
+            awk -v missing_cols="$MISSING_COLUMNS" '
+            BEGIN {
+                split(missing_cols, temp, " ");
+                for (i in temp) missing[temp[i]] = 1;
+            }
+            /^COPY / {
+                in_copy = 1;
+                match($0, /\(.*\)/);
+                cols_str = substr($0, RSTART + 1, RLENGTH - 2);
+                n = split(cols_str, cols_arr, ",");
+                
+                table = $2;
+                new_cols = "";
+                delete skip_indices;
+                
+                for (i=1; i<=n; i++) {
+                    col_name = cols_arr[i];
+                    # Trim spaces
+                    gsub(/^[ \t]+|[ \t]+$/, "", col_name);
+                    # Remove quotes for lookup
+                    col_lookup = col_name;
+                    gsub(/"/, "", col_lookup);
+                    
+                    full_name = table "." col_lookup;
+                    if (full_name in missing) {
+                        skip_indices[i] = 1;
+                    } else {
+                        new_cols = (new_cols == "" ? "" : new_cols ", ") col_name;
+                    }
+                }
+                
+                # Rewrite COPY line
+                sub(/\(.*\)/, "(" new_cols ")", $0);
+                print $0;
+                next;
+            }
+            /^\./ { in_copy = 0; print; next; }
+            in_copy {
+                n = split($0, row, "\t");
+                new_row = "";
+                first = 1;
+                for (i=1; i<=n; i++) {
+                    if (!(i in skip_indices)) {
+                        new_row = (first ? "" : new_row "\t") row[i];
+                        first = 0;
+                    }
+                }
+                print new_row;
+                next;
+            }
+            { print }
+            ' "$RESTORE_FILE"
+        else
+            cat "$RESTORE_FILE"
         fi
-        cat "$RESTORE_FILE"
         echo "COMMIT;"
     } | psql "$DB_URL" -v ON_ERROR_STOP=1 >/dev/null
 

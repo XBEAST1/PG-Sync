@@ -9,19 +9,22 @@
   - **Data**: Pure table data excluding migration metadata (Alembic, Prisma, etc.).
   - **Full**: Comprehensive snapshots including both schema and data.
 - **Intelligent Restoration**
-  - **Smart Selection**: Choose from multiple timestamped backup sets.
-  - **Constraint Handling**: Uses `CASCADE` truncation to safely clear data while respecting foreign keys.
+- **Smart Selection**: Choose from multiple timestamped backup sets.
+- **Constraint Handling**: Uses `CASCADE` truncation to safely clear data while respecting foreign keys.
+- **Schema Drift Adaptation**: Automatically detects and filters out backup columns that are missing in the target database.
 
 - **Developer Experience**
   - **Verbose Progress**: Real-time diagnostic output during backup and restoration.
   - **Cross-Framework Support**: Built-in support for Alembic, Flyway, Prisma, Knex, and Rails.
   - **Production Ready**: Portable backups (`--no-owner`, `--no-privileges`).
 - **Security & Safety**
-  - **Connection Testing**: Validates database connectivity before operations begin.
-  - **Error Detection**: All backup operations verify success before proceeding.
-  - **Zero Persistence**: Database credentials exist only in current process memory.
-  - **Git Safety**: Auto-configures `.gitignore` for the script and data folder.
-  - **Atomic Restores**: Uses `ON_ERROR_STOP` to prevent partial data corruption.
+- **Connection Testing**: Validates database connectivity before operations begin.
+- **Error Detection**: All backup operations verify success before proceeding.
+- **Integrity Verification**: Generates and verifies SHA256 checksums to ensure backup reliability.
+- **Process Locking**: Prevents multiple script instances from running simultaneously.
+- **Zero Persistence**: Database credentials exist only in current process memory.
+- **Git Safety**: Auto-configures `.gitignore` for the script and data folder.
+- **Atomic Restores**: Uses `ON_ERROR_STOP` and explicit transactions to prevent data corruption.
 
 ## Installation
 
@@ -81,11 +84,12 @@ Input your connection string when prompted:
 
 Backups are organized into timestamped sets within the `pg-sync-db-backup/` directory. Each operation creates a new folder:
 
-| File            | Type      | Best Used For                             |
-| --------------- | --------- | ----------------------------------------- |
-| `schema.sql`    | Structure | Replicating structure in new environments |
-| `data.sql`      | Content   | Syncing data between existing databases   |
-| `full_data.sql` | Complete  | Disaster recovery and full snapshots      |
+| File               | Type      | Best Used For                             |
+| ------------------ | --------- | ----------------------------------------- |
+| `schema.sql`       | Structure | Replicating structure in new environments |
+| `data.sql`         | Content   | Syncing data between existing databases   |
+| `full_data.sql`    | Complete  | Disaster recovery and full snapshots      |
+| `checksums.sha256` | Integrity | Verifying data hasn't been corrupted      |
 
 **Folder Pattern**: `pg-sync-db-backup/backup_DD-MM-YYYY_HH-MMPM/`
 
