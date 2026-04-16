@@ -43,20 +43,29 @@ cleanup_partial_backup() {
 }
 
 ensure_gitignore() {
-    local gitignore_path="$SCRIPT_DIR/.gitignore"
+    local global_gitignore=$(git config --global --get core.excludesfile | sed "s|^~|$HOME|")
     local script_name="pg-sync.sh"
     local folder_name="pg-sync-db-backup"
-    
-    [ -f "$gitignore_path" ] && grep -qxF "$folder_name" "$gitignore_path" >/dev/null 2>&1 && return
 
-    echo -e "${CYAN}Adding PG-Sync entries to .gitignore...${NC}\n"
-    
-    [ -s "$gitignore_path" ] && echo "" >> "$gitignore_path"
-    
-    echo "" >> "$gitignore_path"
-    echo "# PG-Sync Backup Data" >> "$gitignore_path"
-    echo "$script_name" >> "$gitignore_path"
-    echo "$folder_name" >> "$gitignore_path"
+    if [ -z "$global_gitignore" ]; then
+        global_gitignore="$HOME/.gitignore"
+        [ ! -f "$global_gitignore" ] && touch "$global_gitignore"
+        git config --global core.excludesfile "$global_gitignore"
+        echo -e "${CYAN}Created global gitignore at $global_gitignore and activated it.${NC}"
+    elif [[ "$global_gitignore" != /* ]]; then
+        global_gitignore="$HOME/$global_gitignore"
+    fi
+
+    [ ! -f "$global_gitignore" ] && touch "$global_gitignore"
+    if ! grep -qxF "$folder_name" "$global_gitignore" >/dev/null 2>&1 || ! grep -qxF "$script_name" "$global_gitignore" >/dev/null 2>&1; then
+        echo -e "${CYAN}Updating global gitignore ($global_gitignore)...${NC}"
+        {
+            echo ""
+            echo "# PG-Sync Backup Data"
+            echo "$script_name"
+            echo "$folder_name"
+        } >> "$global_gitignore"
+    fi
 }
 
 get_db_connection() {
@@ -65,21 +74,26 @@ get_db_connection() {
     echo ""
     read -r DB_URL
     
+    # Normalize the URL for libpq tools by stripping driver suffixes
+    # e.g., postgresql+asyncpg:// -> postgresql://
+    DB_URL=$(echo "$DB_URL" | sed -E 's|^postgresql\+[a-zA-Z0-9_-]+://|postgresql://|')
+
     if [[ ! "$DB_URL" =~ ^postgres(ql)?:// ]]; then
         echo -e "${RED}✗ Invalid database URL format${NC}"
         exit 1
     fi
     
-    local DB_USER=$(echo "$DB_URL" | sed -n 's|^.*://\([^:]*\):.*|\1|p')
-    local DB_HOST=$(echo "$DB_URL" | sed -n 's|.*@\([^:]*\):.*|\1|p')
-    local DB_PORT=$(echo "$DB_URL" | sed -n 's|.*:\([0-9]*\)/.*|\1|p')
-    local DB_NAME=$(echo "$DB_URL" | sed -n 's|.*/\([^/?]*\).*|\1|p')
+    local DB_USER=$(echo "$DB_URL" | sed -nE 's|^.*://([^:/@]+).*@.*|\1|p')
+    local DB_HOST=$(echo "$DB_URL" | sed -nE 's|.*@([^:/@?]+).*|\1|p')
+    [ -z "$DB_HOST" ] && DB_HOST=$(echo "$DB_URL" | sed -nE 's|.*://([^:/@?]+).*|\1|p')
+    local DB_PORT=$(echo "$DB_URL" | sed -nE 's|.*:([0-9]+)(/.*)?$|\1|p')
+    local DB_NAME=$(echo "$DB_URL" | sed -nE 's|.*/([^/?]+).*|\1|p')
     
     echo -e "${GREEN}✓ Connection details parsed${NC}"
-    echo -e "  Host: ${DB_HOST}"
-    echo -e "  Port: ${DB_PORT}"
-    echo -e "  Database: ${DB_NAME}"
-    echo -e "  User: ${DB_USER}"
+    echo -e "  Host: ${DB_HOST:-unknown}"
+    echo -e "  Port: ${DB_PORT:-default (5432)}"
+    echo -e "  Database: ${DB_NAME:-unknown}"
+    echo -e "  User: ${DB_USER:-current user}"
     echo ""
 }
 
